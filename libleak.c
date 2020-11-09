@@ -38,6 +38,7 @@ static char *conf_pid_file = "/tmp/libleak.enabled";
 static char *conf_log_file = "/tmp/libleak";
 
 
+
 /* ### hooking symbols */
 static void *(*leak_real_malloc)(size_t size);
 static void (*leak_real_free)(void *ptr);
@@ -46,10 +47,34 @@ static void *(*leak_real_realloc)(void *ptr, size_t size);
 static pid_t (*leak_real_fork)(void); /* open new log file for new process */
 
 
+// mmap
+static void *(*leak_real_mmap)(void *addr, size_t length, int prot, int flags,
+                  int fd, off_t offset);
+static int (*leak_real_munmap)(void *addr, size_t length);
+static void *(*leak_real_mremap)(void *old_address, size_t old_size,
+                    size_t new_size, int flags, ... /* void *new_address */);
+
+
+
+// brk
+static int (*leak_real_brk)(void *addr);
+static void *(*leak_real_sbrk)(intptr_t increment);
+
+
 /* ### running flags */
 static bool leak_inited;
 static __thread bool leak_in_process;
 static FILE *leak_log_filp;
+static FILE *leak_config_filp;
+
+
+/* ### estimation of current crt heap size ### */
+static size_t s_total_crt_size = 0;
+static size_t s_total_crt_size_prev = 0;
+static size_t s_total_crt_size_max = 0;
+
+static int g_bp_callstack_id = -1;
+static int g_bp_cont = 0;
 
 
 /* ### structures and utils for call-stack and memory-block */
@@ -176,36 +201,33 @@ static bool tmp_free(void *p)
 /* ### report statistics on exiting */
 static void leak_report(void)
 {
-	fprintf(leak_log_filp, "\n# callstack statistics: (in ascending order)\n\n");
-
-	struct leak_callstack *callstacks[wuy_dict_count(leak_callstack_dict)];
-
-	int count = 0;
-	wuy_dict_node_t *node;
-	wuy_dict_iter(leak_callstack_dict, node) {
-		struct leak_callstack *cs = wuy_containerof(node,
-				struct leak_callstack, dict_node);
-		if (cs->expired_count == cs->free_expired_count) {
-			continue;
-		}
-		callstacks[count++] = cs;
-	}
-
-	qsort(callstacks, count, sizeof(struct leak_callstack *), leak_callstack_cmp);
+	fprintf(leak_log_filp, "\n# callstack statistics: (in no particular order)\n");
+    fflush(leak_log_filp);
+    if (leak_callstack_dict == NULL)
+    {
+        fprintf(leak_log_filp, "leak_callstack_dict is NULL\n");
+        fflush(leak_log_filp);
+        return;
+    }
 
 	time_t now = time(NULL);
+    wuy_dict_node_t *node;
+    wuy_dict_iter(leak_callstack_dict, node) {
+        struct leak_callstack *cs = wuy_containerof(node,
+                struct leak_callstack, dict_node);
 
-	for (int i = 0; i < count; i++) {
-		struct leak_callstack *cs = callstacks[i];
+        if (cs->expired_count == cs->free_expired_count) {
+            continue;
+        }
 
-		time_t unfree_max = 0;
-		if (!wuy_list_empty(&cs->expired_list)) {
-			struct leak_memblock *mb = wuy_containerof(
-				wuy_list_first(&cs->expired_list),
-				struct leak_memblock, list_node);
-			unfree_max = now - mb->create;
-		}
-		fprintf(leak_log_filp, "callstack[%d]: may-leak=%d (%zu bytes)\n"
+        time_t unfree_max = 0;
+        if (!wuy_list_empty(&cs->expired_list)) {
+            struct leak_memblock *mb = wuy_containerof(
+                wuy_list_first(&cs->expired_list),
+                struct leak_memblock, list_node);
+            unfree_max = now - mb->create;
+        }
+        fprintf(leak_log_filp, "callstack[%d]: may-leak=%d (%zu bytes)\n"
                                 "    expired=%d (%zu bytes), free_expired=%d (%zu bytes)\n"
                                 "    alloc=%d (%zu bytes), free=%d (%zu bytes)\n"
                                 "    freed memory live time: min=%ld max=%ld average=%ld\n"
@@ -220,7 +242,7 @@ static void leak_report(void)
                                 cs->free_min, cs->free_max,
                                 cs->free_count ? cs->free_total / cs->free_count : 0,
                                 unfree_max);
-	}
+    }
 }
 
 
@@ -264,6 +286,21 @@ static void __attribute__((constructor))init(void)
 
 	leak_real_fork = dlsym(RTLD_NEXT, "fork");
 	assert(leak_real_fork != NULL);
+
+    leak_real_mmap = dlsym(RTLD_NEXT, "mmap"); 
+    assert(leak_real_mmap != NULL);
+
+    leak_real_munmap = dlsym(RTLD_NEXT, "munmap");
+    assert(leak_real_munmap != NULL);
+
+    leak_real_mremap = dlsym(RTLD_NEXT, "mremap");
+    assert(leak_real_mremap != NULL);
+
+    leak_real_brk = dlsym(RTLD_NEXT, "brk");
+    assert(leak_real_brk != NULL);
+
+    leak_real_sbrk = dlsym(RTLD_NEXT, "sbrk");
+    assert(leak_real_sbrk != NULL);
 
 	/* init dict and memory pool */
 	leak_callstack_dict = wuy_dict_new_func(leak_callstack_hash,
@@ -319,15 +356,47 @@ static void leak_expire(void)
 		wuy_list_append(&cs->expired_list, &mb->list_node);
 		pthread_mutex_unlock(&cs->mutex);
 
-		fprintf(leak_log_filp, "callstack[%d] expires. count=%d size=%zu/%zu alloc=%d free=%d\n",
-				cs->id, cs->expired_count, mb->size, cs->expired_size,
-				cs->alloc_count, cs->free_count);
-
 		if ((cs->expired_count % 100) == 1) {
 			/* print callstack once every 100 expiration */
+    		fprintf(leak_log_filp, "callstack[%d] expires. count=%d size=%zu/%zu alloc=%d free=%d alloc_size=%zu free_size=%zu\n",
+				cs->id, cs->expired_count, mb->size, cs->expired_size,
+				cs->alloc_count, cs->free_count, cs->alloc_size, cs->free_size);
+
 			leak_callstack_print(cs);
 		}
 	}
+
+    // 100MB
+    if (s_total_crt_size_max - s_total_crt_size_prev > 5 * 1024 * 1024)
+    {
+        fprintf(leak_log_filp, "[CRT] Current CRT estimation: %ld\n", s_total_crt_size);
+        fprintf(leak_log_filp, "[CRTMAX] Current max CRT estimation: %ld\n", s_total_crt_size_max);
+        fprintf(leak_log_filp, "> Leaked enough to attach:\n ");
+        fflush(leak_log_filp);
+
+        int callstack_id = 0;
+        int should_cont = 0;
+
+        while(!should_cont)
+        {
+    	    leak_config_filp = fopen("/tmp/libleak.config", "r");
+            fscanf(leak_config_filp, "%d", &callstack_id);
+            fscanf(leak_config_filp, "%d", &should_cont);
+            fprintf(leak_log_filp, "> bp callstack: %d\n", callstack_id);
+            fprintf(leak_log_filp, "> continue? %d\n",should_cont);
+            fflush(leak_log_filp);
+
+            if (should_cont) break;
+
+            sleep(5);
+            fclose(leak_config_filp);
+        }
+        g_bp_callstack_id = callstack_id;
+
+        leak_report();
+
+        s_total_crt_size_prev = s_total_crt_size_max;
+    }
 	pthread_mutex_unlock(&leak_memblock_mutex);
 
 	fflush(leak_log_filp);
@@ -416,6 +485,9 @@ static struct leak_callstack *leak_current(void)
 
 static void leak_process_alloc(void *p, size_t size)
 {
+    s_total_crt_size += size;
+    s_total_crt_size_max = s_total_crt_size > s_total_crt_size_max ? s_total_crt_size : s_total_crt_size_max;
+
 	if (!leak_inited) {
 		return;
 	}
@@ -450,9 +522,34 @@ static void leak_process_alloc(void *p, size_t size)
 
 	wuy_dict_add(leak_memblock_dict, mb);
 	wuy_list_append(&leak_memblock_list, &mb->list_node);
+
+    //fprintf(leak_log_filp, "[A] addr: %p, size: %lu, callstack: %d\n", p, size, cs->id);
+
+
 	pthread_mutex_unlock(&leak_memblock_mutex);
 
 	leak_expire();
+
+    if (cs->id ==  g_bp_callstack_id && g_bp_callstack_id != 0)
+    {
+        fprintf(leak_log_filp, "Blocking for debugger to attach at callstack %d...\n", cs->id);
+        // break here
+        int debugger_attached;
+        while(true)
+        {
+    	    FILE * leak_debug_config_filp = fopen("/tmp/libleak_debug.config", "r");
+            fscanf(leak_config_filp, "%d", &debugger_attached);
+            fclose(leak_config_filp);
+            if (debugger_attached) 
+            {
+                fprintf(leak_log_filp, "Debugger finished. Letting go\n");
+                fflush(leak_log_filp);
+                break;
+            }
+            fprintf(leak_log_filp, "Waiting for debugger to attach...\n");
+            sleep(5);
+        }
+    }
 
 	leak_in_process = false;
 }
@@ -493,6 +590,8 @@ static void leak_process_free(void *p)
 	cs->free_count++;
 	cs->free_size += mb->size;
 
+    //fprintf(leak_log_filp, "[F] addr: %p, size: %lu, callstack: %d\n", p, mb->size, cs->id);
+
 	if (mb->expired) {
 		cs->free_expired_count++;
 		cs->free_expired_size += mb->size;
@@ -520,6 +619,8 @@ static void leak_process_free(void *p)
 		cs->free_min = t;
 	}
 	cs->free_total += t;
+    s_total_crt_size = s_total_crt_size > mb->size ? s_total_crt_size - mb->size : 0;
+
 	pthread_mutex_unlock(&cs->mutex);
 
 	leak_expire();
@@ -558,6 +659,59 @@ static void leak_process_update(void *p, size_t size)
 
 	leak_in_process = false;
 }
+
+void *mmap(void *addr, size_t length, int prot, int flags,
+                  int fd, off_t offset)
+{
+    assert(leak_real_mmap != NULL);
+
+    void *p = leak_real_mmap(addr, length, prot, flags, fd, offset);
+    //leak_process_mmap(addr, length, prot, flags, fd, offset);
+
+    fprintf(leak_log_filp, "[M] addr: %p, length: %lu\n", addr, length);
+    return p;
+}
+
+int munmap(void *addr, size_t length)
+{
+    assert(leak_real_munmap != NULL);
+    int p = leak_real_munmap(addr, length);
+
+    fprintf(leak_log_filp, "[U] addr: %p, length: %lu\n", addr, length);
+    return p;
+}
+
+void *mremap(void *old_address, size_t old_size,
+                    size_t new_size, int flags, ... /* void *new_address */)
+{
+    assert(leak_real_mremap != NULL);
+    void * p = leak_real_mremap(old_address, old_size, new_size, flags);
+    fprintf(leak_log_filp, "[R] addr: %p, old_size: %lu, new_size: %lu\n", old_address, old_size, new_size);
+
+    return p;
+}
+
+
+
+int brk(void *addr)
+{
+    assert(leak_real_brk != NULL);
+    int p = leak_real_brk(addr);
+    fprintf(leak_log_filp, "[B] addr: %p\n", addr);
+    return p;
+}
+
+void *sbrk(intptr_t increment)
+{
+    assert(leak_real_sbrk != NULL);
+    void * p = leak_real_sbrk(increment);
+    fprintf(leak_log_filp, "[S] incr: %lu\n", increment);
+    return p;
+}
+
+
+
+
 
 void *malloc(size_t size)
 {
